@@ -12,7 +12,14 @@ PASS = ''
 BUFLEN = 4096 * 4
 TIMEOUT = 60
 DEFAULT_HOST = '127.0.0.1:109'
-RESPONSE = 'HTTP/1.1 101 Switching Protocols\r\n\r\nContent-Length: 104857600000\r\n\r\n'
+RESPONSE = 'HTTP/1.1 101 Switching Protocols\r\n' + \
+           'Upgrade: websocket\r\n' + \
+           'Connection: Upgrade\r\n' + \
+           'Sec-WebSocket-Accept: OK\r\n' + \
+           'Access-Control-Allow-Origin: *\r\n' + \
+           'Access-Control-Allow-Credentials: true\r\n' + \
+           'Access-Control-Allow-Methods: GET, POST, PUT, DELETE, OPTIONS\r\n' + \
+           'Access-Control-Allow-Headers: X-Real-Host,X-Split,X-Pass,Content-Type\r\n\r\n'
 
 class Server(threading.Thread):
     def __init__(self, host, port):
@@ -112,7 +119,12 @@ class ConnectionHandler(threading.Thread):
     def run(self):
         try:
             self.client_buffer = self.client.recv(BUFLEN)
-
+            
+            # Check if it's a websocket request
+            upgrade_header = self.findHeader(self.client_buffer, 'Upgrade')
+            if upgrade_header.lower() == 'websocket':
+                self.client.send(RESPONSE)
+                
             hostPort = self.findHeader(self.client_buffer, 'X-Real-Host')
 
             if hostPort == '':
@@ -172,21 +184,33 @@ class ConnectionHandler(threading.Thread):
             else:
                 port = sys.argv[1]
 
-        (soc_family, soc_type, proto, _, address) = socket.getaddrinfo(host, port)[0]
+        try:
+            (soc_family, soc_type, proto, _, address) = socket.getaddrinfo(host, port)[0]
 
-        self.target = socket.socket(soc_family, soc_type, proto)
-        self.targetClosed = False
-        self.target.connect(address)
+            self.target = socket.socket(soc_family, soc_type, proto)
+            self.target.settimeout(10)  # Add timeout to prevent hanging
+            self.targetClosed = False
+            self.target.connect(address)
+            self.target.setblocking(0)  # Set non-blocking mode
+        except socket.error as e:
+            self.log += ' - Failed to connect to target: ' + str(e)
+            raise
 
     def method_CONNECT(self, path):
         self.log += ' - CONNECT ' + path
 
-        self.connect_target(path)
-        self.client.sendall(RESPONSE)
-        self.client_buffer = ''
+        try:
+            self.connect_target(path)
+            # Add connection established header to prevent 302
+            self.client.sendall(RESPONSE)
+            self.client_buffer = ''
 
-        self.server.printLog(self.log)
-        self.doCONNECT()
+            self.server.printLog(self.log)
+            self.doCONNECT()
+        except Exception as e:
+            self.log += ' - Connection failed: ' + str(e)
+            self.client.send('HTTP/1.1 502 Bad Gateway\r\n\r\n')
+            self.server.printLog(self.log)
 
     def doCONNECT(self):
         socs = [self.client, self.target]
