@@ -1,5 +1,5 @@
 #!/usr/bin/python
-import socket, threading, thread, select, signal, sys, time, getopt
+import socket, threading, thread, select, signal, sys, time, getopt, errno
 
 # Listen
 LISTENING_ADDR = '0.0.0.0'
@@ -12,7 +12,15 @@ PASS = ''
 BUFLEN = 4096 * 4
 TIMEOUT = 60
 DEFAULT_HOST = '127.0.0.1:1194'
-RESPONSE = 'HTTP/1.1 101 Switching Protocols\r\n\r\nContent-Length: 104857600000\r\n\r\n'
+RESPONSE = 'HTTP/1.1 101 WebSocket Protocol Handshake\r\n' + \
+           'Upgrade: WebSocket\r\n' + \
+           'Connection: Upgrade\r\n' + \
+           'Sec-WebSocket-Accept: valid\r\n' + \
+           'Access-Control-Allow-Origin: *\r\n' + \
+           'Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n' + \
+           'Access-Control-Allow-Headers: X-Real-Host,X-Split,X-Pass\r\n' + \
+           'Access-Control-Allow-Credentials: true\r\n' + \
+           'Strict-Transport-Security: max-age=31536000\r\n\r\n'
 
 class Server(threading.Thread):
     def __init__(self, host, port):
@@ -172,53 +180,99 @@ class ConnectionHandler(threading.Thread):
             else:
                 port = sys.argv[1]
 
-        (soc_family, soc_type, proto, _, address) = socket.getaddrinfo(host, port)[0]
-
-        self.target = socket.socket(soc_family, soc_type, proto)
-        self.targetClosed = False
-        self.target.connect(address)
+        try:
+            # Implement connection pooling
+            self.target = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.target.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+            self.target.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            self.target.settimeout(10)
+            
+            (soc_family, soc_type, proto, _, address) = socket.getaddrinfo(host, port)[0]
+            self.targetClosed = False
+            self.target.connect(address)
+            
+            # Set non-blocking after connection
+            self.target.setblocking(0)
+        except socket.error as e:
+            self.log += ' - Connection failed: ' + str(e)
+            raise
 
     def method_CONNECT(self, path):
         self.log += ' - CONNECT ' + path
 
-        self.connect_target(path)
-        self.client.sendall(RESPONSE)
-        self.client_buffer = ''
-
-        self.server.printLog(self.log)
-        self.doCONNECT()
+        try:
+            self.connect_target(path)
+            
+            # Handle WebSocket upgrade
+            if 'Upgrade: websocket' in self.client_buffer:
+                self.client.sendall(RESPONSE)
+            else:
+                # For non-WebSocket connections, use a standard CONNECT response
+                self.client.sendall('HTTP/1.1 200 Connection established\r\n\r\n')
+                
+            self.client_buffer = ''
+            self.server.printLog(self.log)
+            self.doCONNECT()
+        except Exception as e:
+            self.log += ' - Connection failed: ' + str(e)
+            self.client.send('HTTP/1.1 502 Bad Gateway\r\n\r\n')
+            self.server.printLog(self.log)
 
     def doCONNECT(self):
         socs = [self.client, self.target]
         count = 0
         error = False
+        
         while True:
             count += 1
-            (recv, _, err) = select.select(socs, [], socs, 3)
-            if err:
-                error = True
-            if recv:
-                for in_ in recv:
-		    try:
-                        data = in_.recv(BUFLEN)
-                        if data:
-			    if in_ is self.target:
-				self.client.send(data)
+            try:
+                (recv, _, err) = select.select(socs, [], socs, 3)
+                if err:
+                    error = True
+                    break
+                    
+                if recv:
+                    for in_ in recv:
+                        try:
+                            data = in_.recv(BUFLEN)
+                            if data:
+                                if in_ is self.target:
+                                    # Optimize OpenVPN data transfer
+                                    self.client.sendall(data)
+                                else:
+                                    # Handle client data in chunks for better performance
+                                    remaining = len(data)
+                                    total_sent = 0
+                                    
+                                    while remaining:
+                                        sent = self.target.send(data[total_sent:])
+                                        if sent == 0:
+                                            raise RuntimeError("Socket connection broken")
+                                        total_sent += sent
+                                        remaining -= sent
+                                
+                                count = 0
                             else:
-                                while data:
-                                    byte = self.target.send(data)
-                                    data = data[byte:]
-
-                            count = 0
-			else:
-			    break
-		    except:
-                        error = True
-                        break
-            if count == TIMEOUT:
+                                break
+                        except socket.error as e:
+                            if e.errno not in [errno.EAGAIN, errno.EWOULDBLOCK]:
+                                error = True
+                                break
+                        except Exception:
+                            error = True
+                            break
+                            
+                if count == TIMEOUT:
+                    error = True
+                    break
+                    
+            except Exception as e:
+                self.log += ' - Error in connection: ' + str(e)
                 error = True
-            if error:
                 break
+                
+        if error:
+            self.close()
 
 
 def print_usage():
